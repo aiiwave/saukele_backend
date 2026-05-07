@@ -1,0 +1,294 @@
+// prisma/schema.prisma — SOURCE OF TRUTH for all models
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  GUEST
+  COUPLE
+  ADMIN
+  DELIVERY_PARTNER
+}
+
+enum RegistryVisibility {
+  PUBLIC
+  INVITE_ONLY
+  PRIVATE
+}
+
+enum GiftStatus {
+  AVAILABLE
+  RESERVED
+  PURCHASED
+  DELIVERED
+  SUBSTITUTED
+}
+
+enum ContributionType {
+  SOLO
+  POOL
+}
+
+enum ContributionStatus {
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+}
+
+enum PoolStatus {
+  PENDING
+  FUNDED
+  PURCHASED
+  DELIVERED
+}
+
+enum KinshipTier {
+  ATA_ANA       // Tier 1: Parents / grandparents
+  ZHIEN_ZHARAN  // Tier 2: Close relatives
+  DOS           // Tier 3: Friends
+  BASKA         // Tier 4: Other / acquaintances
+}
+
+enum Currency {
+  KZT
+  EUR
+  USD
+}
+
+enum AuditAction {
+  CONTRIBUTION_CREATED
+  PAYMENT_COMPLETED
+  REFUND_ISSUED
+  REGISTRY_CREATED
+  REGISTRY_EXPIRED
+  ADMIN_OVERRIDE
+  USER_SUSPENDED
+  EXCHANGE_RATE_SET
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String?  @unique
+  phone        String?  @unique
+  passwordHash String?
+  role         Role     @default(GUEST)
+  isActive     Boolean  @default(true)
+  isVerified   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownedRegistries          Registry[]
+  contributions            Contribution[]
+  kinshipNodes             FamilyMember[]            @relation("UserKinship")
+  auditLogs                AuditLog[]
+  refreshTokens            RefreshToken[]
+  emailVerificationTokens  EmailVerificationToken[]
+  passwordResetTokens      PasswordResetToken[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([role, isActive])
+}
+
+/// One-time email verification tokens. Issued on registration / resend.
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+}
+
+/// One-time password-reset tokens. Token is stored as a SHA-256 hash; the
+/// raw value only ever lives in the email link, never in the DB.
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+}
+
+model Registry {
+  id            String             @id @default(cuid())
+  ownerId       String
+  title         String
+  weddingDate   DateTime
+  venue         String?
+  coverImageUrl String?
+  visibility    RegistryVisibility @default(INVITE_ONLY)
+  inviteCode    String             @unique @default(cuid())
+  isExpired     Boolean            @default(false)
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  owner         User           @relation(fields: [ownerId], references: [id])
+  giftItems     GiftItem[]
+  familyMembers FamilyMember[]
+
+  @@index([ownerId])
+  @@index([visibility, isExpired])
+  @@index([inviteCode])
+  @@index([weddingDate])
+}
+
+model GiftItem {
+  id              String     @id @default(cuid())
+  registryId      String
+  title           String
+  description     String?
+  imageUrl        String?
+  priceKzt        Int        // stored in tiyn (1 KZT = 100 tiyn)
+  status          GiftStatus @default(AVAILABLE)
+  isPool          Boolean    @default(false)
+  poolTargetKzt   Int?       // total pool target in tiyn
+  poolCollectedKzt Int?      @default(0) // total collected in tiyn
+  poolStatus      PoolStatus @default(PENDING)
+  externalUrl     String?
+  quantity        Int        @default(1)
+  reservedBy      String?    // userId who reserved (SOLO only)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  registry      Registry       @relation(fields: [registryId], references: [id])
+  contributions Contribution[]
+
+  @@index([registryId, status])
+  @@index([registryId, isPool])
+  @@index([reservedBy])
+}
+
+model Contribution {
+  id               String             @id @default(cuid())
+  giftItemId       String
+  userId           String
+  type             ContributionType
+  status           ContributionStatus @default(PENDING)
+  amountKzt        Int                // in tiyn
+  amountOriginal   Int?               // in foreign currency tiyn-equivalent
+  currency         Currency           @default(KZT)
+  exchangeRateId   String?
+  idempotencyKey   String             @unique @default(cuid())
+  paymentSessionId String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  giftItem        GiftItem             @relation(fields: [giftItemId], references: [id])
+  user            User                 @relation(fields: [userId], references: [id])
+  exchangeRate    ExchangeRateSnapshot? @relation(fields: [exchangeRateId], references: [id])
+  paymentTransaction PaymentTransaction?
+
+  @@index([giftItemId, status])
+  @@index([userId, createdAt])
+  @@index([idempotencyKey])
+}
+
+model PaymentTransaction {
+  id             String   @id @default(cuid())
+  contributionId String   @unique
+  provider       String   // 'kaspi' | 'stripe'
+  providerTxId   String   @unique
+  amountKzt      Int
+  status         String   // 'pending' | 'completed' | 'failed' | 'refunded'
+  rawPayload     Json?    // full webhook payload for auditing
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  contribution Contribution @relation(fields: [contributionId], references: [id])
+
+  @@index([providerTxId])
+  @@index([status, createdAt])
+}
+
+/// Immutable exchange rate snapshots — NEVER update historical rows
+model ExchangeRateSnapshot {
+  id             String   @id @default(cuid())
+  fromCurrency   Currency
+  toCurrency     Currency
+  rate           Float    // e.g. 1 USD = 460.25 KZT stored as 460.25
+  amountKzt      Int      // reference amount in tiyn
+  amountForeign  Int      // reference amount in foreign tiyn-equivalent
+  lockedAt       DateTime @default(now())
+
+  contributions Contribution[]
+
+  @@index([fromCurrency, toCurrency, lockedAt])
+}
+
+/// Self-referential kinship tree — enables recursive CTE queries
+model FamilyMember {
+  id               String      @id @default(cuid())
+  registryId       String
+  userId           String
+  parentId         String?     // null = root of tree
+  kinshipTier      KinshipTier
+  kinshipLabel     String?     // e.g. 'ата', 'жиен', 'аға'
+  giftTierOverride Int?        // couple can override tier 1-4
+
+  createdAt DateTime @default(now())
+
+  registry Registry       @relation(fields: [registryId], references: [id])
+  user     User           @relation("UserKinship", fields: [userId], references: [id])
+  parent   FamilyMember?  @relation("KinshipTree", fields: [parentId], references: [id])
+  children FamilyMember[] @relation("KinshipTree")
+
+  @@unique([registryId, userId]) // guest appears once per registry
+  @@index([registryId, kinshipTier])
+  @@index([parentId])
+}
+
+/// Append-only audit log — enforced at application layer (auditRepository has no update/delete)
+model AuditLog {
+  id         String      @id @default(cuid())
+  actorId    String
+  action     AuditAction
+  entityType String      // 'Contribution' | 'Registry' | 'User' | etc.
+  entityId   String
+  before     Json?       // state before change
+  after      Json?       // state after change
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime    @default(now())
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+}
