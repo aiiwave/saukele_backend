@@ -1,0 +1,842 @@
+openapi: 3.0.3
+info:
+  title: Saukele Wedding Registry API
+  version: 1.0.0
+  description: |
+    Backend API for the Saukele Kazakh wedding gift registry platform.
+
+    All endpoints are prefixed with `/v1`. Webhooks live under `/v1/webhooks` and
+    require raw-body HMAC verification.
+
+    Errors follow a single shape:
+    ```json
+    { "error": { "code": "ERROR_CODE", "message": "human readable" } }
+    ```
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Registries
+  - name: Gifts
+  - name: Contributions
+  - name: Kinship
+  - name: Admin
+  - name: Webhooks
+  - name: Health
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              example: Request validation failed
+            details:
+              type: object
+              additionalProperties: true
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        role:
+          type: string
+          enum: [GUEST, COUPLE, ADMIN, DELIVERY_PARTNER]
+        isActive: { type: boolean }
+        isVerified: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AuthTokens:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        expiresIn: { type: integer, example: 86400 }
+        user: { $ref: '#/components/schemas/User' }
+        message: { type: string }
+
+    Registry:
+      type: object
+      properties:
+        id: { type: string }
+        ownerId: { type: string }
+        title: { type: string }
+        weddingDate: { type: string, format: date-time }
+        venue: { type: string, nullable: true }
+        coverImageUrl: { type: string, nullable: true }
+        visibility:
+          type: string
+          enum: [PUBLIC, INVITE_ONLY, PRIVATE]
+        inviteCode: { type: string }
+        isExpired: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    GiftItem:
+      type: object
+      properties:
+        id: { type: string }
+        registryId: { type: string }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        imageUrl: { type: string, nullable: true }
+        priceKzt: { type: integer, description: stored in tiyn (1 KZT = 100 tiyn) }
+        status:
+          type: string
+          enum: [AVAILABLE, RESERVED, PURCHASED, DELIVERED, SUBSTITUTED]
+        isPool: { type: boolean }
+        poolTargetKzt: { type: integer, nullable: true }
+        poolCollectedKzt: { type: integer, nullable: true }
+        poolStatus:
+          type: string
+          enum: [PENDING, FUNDED, PURCHASED, DELIVERED]
+
+    Contribution:
+      type: object
+      properties:
+        id: { type: string }
+        giftItemId: { type: string }
+        userId: { type: string }
+        type:
+          type: string
+          enum: [SOLO, POOL]
+        status:
+          type: string
+          enum: [PENDING, PAID, REFUNDED, FAILED]
+        amountKzt: { type: integer }
+        currency:
+          type: string
+          enum: [KZT, EUR, USD]
+        idempotencyKey: { type: string }
+
+    PageResult:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { type: object }
+        nextCursor: { type: string, nullable: true }
+        hasMore: { type: boolean }
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: Base64 cursor returned by the previous page
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  responses:
+    Unauthorized:
+      description: Missing/invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but lacks required role / unverified
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Conflict (e.g., duplicate)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Validation failure
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+paths:
+  # ─── Health ────────────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string }
+                  timestamp: { type: string, format: date-time }
+
+  # ─── Auth ─────────────────────────────────────────────────────────────
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user (rate-limited 5/min/IP)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                email: { type: string, format: email }
+                phone: { type: string, example: '+77001234567' }
+                password: { type: string, format: password }
+                role:
+                  type: string
+                  enum: [GUEST, COUPLE]
+                  default: GUEST
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in (rate-limited 5/min/IP)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                email: { type: string, format: email }
+                phone: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange refresh token for new pair (rotation)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New token pair
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a specific refresh token
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: Logged out }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/logout-all:
+    post:
+      tags: [Auth]
+      summary: Revoke all refresh tokens for the current user
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: All sessions terminated }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the current user's profile
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/verify-email:
+    post:
+      tags: [Auth]
+      summary: Confirm an email-verification token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        '200': { description: Email verified }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Auth]
+      summary: Confirm an email-verification token via link
+      parameters:
+        - in: query
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Email verified }
+
+  /v1/auth/resend-verification:
+    post:
+      tags: [Auth]
+      summary: Re-issue a verification email (always 200, no enumeration)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Generic success }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request a password reset email (always 200, no enumeration)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Generic success }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Consume reset token + set new password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: Password reset; all sessions revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ─── Registries ───────────────────────────────────────────────────────
+  /v1/registries:
+    get:
+      tags: [Registries]
+      summary: List public registries (cursor-paginated)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of registries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PageResult' }
+    post:
+      tags: [Registries]
+      summary: Create a registry (COUPLE/ADMIN, verified only)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, weddingDate]
+              properties:
+                title: { type: string, minLength: 3, maxLength: 120 }
+                weddingDate: { type: string, format: date-time }
+                venue: { type: string }
+                coverImageUrl: { type: string, format: uri }
+                visibility:
+                  type: string
+                  enum: [PUBLIC, INVITE_ONLY, PRIVATE]
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registry: { $ref: '#/components/schemas/Registry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /v1/registries/mine:
+    get:
+      tags: [Registries]
+      summary: List the caller's own registries
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/registries/invite/{code}:
+    get:
+      tags: [Registries]
+      summary: Public access via invite code
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Registry }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/registries/{id}:
+    get:
+      tags: [Registries]
+      summary: Get a registry by id (visibility-aware)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Registry }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Registries]
+      summary: Update a registry (owner only, verified)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                weddingDate: { type: string }
+                venue: { type: string }
+                visibility: { type: string, enum: [PUBLIC, INVITE_ONLY, PRIVATE] }
+      responses:
+        '200': { description: Updated }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ─── Gifts ────────────────────────────────────────────────────────────
+  /v1/registries/{registryId}/gifts:
+    get:
+      tags: [Gifts]
+      summary: List gifts for a registry
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page of gifts }
+    post:
+      tags: [Gifts]
+      summary: Add a gift item (COUPLE only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, priceKzt]
+              properties:
+                title: { type: string }
+                description: { type: string }
+                imageUrl: { type: string, format: uri }
+                priceKzt: { type: integer, description: amount in tiyn }
+                isPool: { type: boolean, default: false }
+                poolTargetKzt: { type: integer }
+                quantity: { type: integer, default: 1 }
+      responses:
+        '201': { description: Created }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/registries/{registryId}/gifts/{giftId}:
+    patch:
+      tags: [Gifts]
+      summary: Update a gift item (owner only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+        - in: path
+          name: giftId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Updated }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Gifts]
+      summary: Delete a gift item (owner only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+        - in: path
+          name: giftId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Deleted }
+
+  /v1/registries/{registryId}/gifts/{giftId}/reserve:
+    post:
+      tags: [Gifts]
+      summary: Solo-reserve a gift (creates a SOLO contribution)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+        - in: path
+          name: giftId
+          required: true
+          schema: { type: string }
+      responses:
+        '201': { description: Reserved }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ─── Contributions ────────────────────────────────────────────────────
+  /v1/contributions/pool:
+    post:
+      tags: [Contributions]
+      summary: Pool contribution (SELECT FOR UPDATE; verified users)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [giftItemId, amountKzt]
+              properties:
+                giftItemId: { type: string }
+                amountKzt: { type: integer, description: amount in tiyn }
+                currency: { type: string, enum: [KZT, EUR, USD], default: KZT }
+                idempotencyKey: { type: string }
+      responses:
+        '201': { description: Created }
+        '200': { description: Idempotent replay }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /v1/contributions/pool/{giftId}/advance:
+    post:
+      tags: [Contributions]
+      summary: Advance pool state (FUNDED→PURCHASED→DELIVERED). COUPLE/ADMIN.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: giftId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Advanced }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/contributions/mine:
+    get:
+      tags: [Contributions]
+      summary: List the caller's contributions
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page }
+
+  # ─── Kinship ──────────────────────────────────────────────────────────
+  /v1/registries/{registryId}/kinship:
+    get:
+      tags: [Kinship]
+      summary: Get the registry's kinship tree (recursive CTE)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Tree }
+    post:
+      tags: [Kinship]
+      summary: Add a family member (COUPLE only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId: { type: string }
+                parentId: { type: string }
+                kinshipTier:
+                  type: string
+                  enum: [ATA_ANA, ZHIEN_ZHARAN, DOS, BASKA]
+                kinshipLabel: { type: string }
+      responses:
+        '201': { description: Added }
+
+  /v1/registries/{registryId}/kinship/my-tier:
+    get:
+      tags: [Kinship]
+      summary: Get the caller's kinship tier in this registry
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Tier }
+
+  /v1/registries/{registryId}/kinship/{memberId}:
+    patch:
+      tags: [Kinship]
+      summary: Update tier/label of a family member
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+        - in: path
+          name: memberId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Updated }
+
+  # ─── Admin ────────────────────────────────────────────────────────────
+  /v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users (ADMIN)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: isActive
+          schema: { type: boolean }
+      responses:
+        '200': { description: Users }
+
+  /v1/admin/users/{userId}/suspend:
+    patch:
+      tags: [Admin]
+      summary: Suspend a user (ADMIN)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Suspended }
+
+  /v1/admin/users/{userId}/activate:
+    patch:
+      tags: [Admin]
+      summary: Re-activate a user (ADMIN)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Activated }
+
+  /v1/admin/registries/{registryId}/expire:
+    patch:
+      tags: [Admin]
+      summary: Force-expire a registry (ADMIN)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: registryId
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Expired }
+
+  /v1/admin/exchange-rates:
+    post:
+      tags: [Admin]
+      summary: Lock a new exchange-rate snapshot (ADMIN, immutable)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromCurrency, toCurrency, rate]
+              properties:
+                fromCurrency: { type: string, enum: [KZT, EUR, USD] }
+                toCurrency: { type: string, enum: [KZT, EUR, USD] }
+                rate: { type: number }
+      responses:
+        '201': { description: Locked }
+
+  /v1/admin/audit:
+    get:
+      tags: [Admin]
+      summary: Query the audit log (ADMIN)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: entityType
+          schema: { type: string }
+        - in: query
+          name: entityId
+          schema: { type: string }
+      responses:
+        '200': { description: Logs }
+
+  /v1/admin/test-email:
+    post:
+      tags: [Admin]
+      summary: Defense demo helper — enqueue a test email job
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to: { type: string, format: email }
+      responses:
+        '200': { description: Job enqueued }
+
+  # ─── Webhooks ─────────────────────────────────────────────────────────
+  /v1/webhooks/kaspi:
+    post:
+      tags: [Webhooks]
+      summary: Kaspi Pay payment webhook (HMAC verified)
+      description: Raw body required. Always returns 200 to suppress retries.
+      responses:
+        '200': { description: Acknowledged }
+
+  /v1/webhooks/stripe:
+    post:
+      tags: [Webhooks]
+      summary: Stripe payment webhook (HMAC verified)
+      responses:
+        '200': { description: Acknowledged }
